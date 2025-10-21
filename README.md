@@ -36,24 +36,71 @@ A real-time network bandwidth visualization tool that displays upload and downlo
 
 ### Prerequisites
 
-- Rust 1.70 or later
-- WLED device on your network
-- For remote monitoring: SSH access to the target host
+- **WLED device** on your network
+- **Rust 1.70 or later** (installation instructions below)
+- **For remote monitoring**: SSH access to the target host
 
-### Build from Source
+### Step 1: Install Rust
+
+If you don't have Rust installed, install it using [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+After installation, restart your terminal and verify:
+```bash
+rustc --version
+cargo --version
+```
+
+### Step 2: Clone the Repository
 
 ```bash
 git clone <repository-url>
 cd rustled
+```
+
+### Step 3: Build the Project
+
+```bash
 cargo build --release
 ```
 
+This compiles an optimized binary. The build process may take a few minutes on the first run as it downloads and compiles dependencies.
+
 The compiled binary will be located at `target/release/bandwidth_meter`.
 
-### Install
+### Step 4: Install (Optional)
+
+**Option A: Install to Cargo bin directory** (recommended)
+
+This installs the binary to `~/.cargo/bin/` which should be in your PATH:
 
 ```bash
 cargo install --path .
+```
+
+After this, you can run `bandwidth_meter` from anywhere.
+
+**Option B: Manual installation**
+
+Copy the binary to a location in your PATH:
+
+```bash
+# System-wide installation
+sudo cp target/release/bandwidth_meter /usr/local/bin/
+
+# Or user-only installation
+mkdir -p ~/bin
+cp target/release/bandwidth_meter ~/bin/
+# Add ~/bin to PATH in ~/.bashrc or ~/.zshrc if not already present
+```
+
+**Option C: Run directly from build directory**
+
+```bash
+./target/release/bandwidth_meter --help
 ```
 
 ## Quick Start
