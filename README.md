@@ -57,8 +57,8 @@ cargo --version
 ### Step 2: Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd rustled
+git clone https://github.com/dlnetworks/wled-bandwidth-meter.git
+cd wled-bandwidth-meter
 ```
 
 ### Step 3: Build the Project
@@ -907,4 +907,4 @@ Options:
 
 ## Support
 
-For issues, questions, or feature requests, please [file an issue](your-issue-tracker-url).
+For issues, questions, or feature requests, please [file an issue](https://github.com/dlnetworks/wled-bandwidth-meter/issues).
