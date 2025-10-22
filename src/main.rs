@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -153,7 +153,7 @@ impl Default for BandwidthConfig {
             interpolation: "linear".to_string(),
             fps: 60.0,
             httpd_enabled: true,
-            httpd_ip: "0.0.0.0".to_string(),
+            httpd_ip: "localhost".to_string(),
             httpd_port: 8080,
             test_tx: false,
             test_rx: false,
@@ -963,6 +963,8 @@ async fn detect_os(host: Option<&String>) -> Result<String> {
         Command::new("ssh")
             .arg(host)
             .arg("uname")
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .output()
             .await?
     } else {
@@ -977,16 +979,54 @@ async fn detect_os(host: Option<&String>) -> Result<String> {
 
 // Spawn bandwidth monitoring command based on OS
 async fn spawn_bandwidth_monitor(args: &Args, config: &BandwidthConfig) -> Result<tokio::process::Child> {
-    // Detect OS
-    let os = detect_os(args.host.as_ref()).await?;
-
-    let child = if os == "Darwin" {
-        // macOS: use netstat
-        spawn_netstat_monitor(args.host.as_ref(), &config.interface).await?
+    if args.host.is_some() {
+        // For remote hosts, use a single SSH connection that auto-detects OS and runs appropriate command
+        spawn_remote_monitor(args.host.as_ref().unwrap(), &config.interface).await
     } else {
-        // Linux: use /proc/net/dev
-        spawn_procnet_monitor(args.host.as_ref(), &config.interface).await?
-    };
+        // Local monitoring - detect OS
+        let os = detect_os(None).await?;
+
+        let child = if os == "Darwin" {
+            // macOS: use netstat
+            spawn_netstat_monitor(None, &config.interface).await?
+        } else {
+            // Linux: use /proc/net/dev
+            spawn_procnet_monitor(None, &config.interface).await?
+        };
+
+        Ok(child)
+    }
+}
+
+// Remote monitoring with OS auto-detection in a single SSH session
+async fn spawn_remote_monitor(host: &String, interface: &str) -> Result<tokio::process::Child> {
+    // Parse comma-separated interfaces for egrep pattern (Linux)
+    let interfaces: Vec<&str> = interface.split(',').map(|s| s.trim()).collect();
+    let egrep_pattern = interfaces.join("|");
+
+    // Create a script that detects OS and runs appropriate monitoring command
+    // This all runs in ONE SSH session, so only ONE password prompt
+    let script = format!(
+        r#"
+OS=$(uname)
+if [ "$OS" = "Darwin" ]; then
+    # macOS
+    netstat -w 1 -I {}
+else
+    # Linux
+    while true; do cat /proc/net/dev | egrep '({})'; sleep 1; done
+fi
+"#,
+        interface, egrep_pattern
+    );
+
+    let child = Command::new("ssh")
+        .arg(host)
+        .arg(&script)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
 
     Ok(child)
 }
@@ -996,13 +1036,13 @@ async fn spawn_netstat_monitor(host: Option<&String>, interface: &str) -> Result
     let netstat_cmd = format!("netstat -w 1 -I {}", interface);
 
     let child = if let Some(host) = host {
-        // Use -tt to force pseudo-terminal allocation, which disables SSH buffering
+        // SSH without pseudo-terminal - allows password prompt via stdin/stderr
         Command::new("ssh")
-            .arg("-tt")
             .arg(host)
             .arg(&netstat_cmd)
+            .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()?
     } else {
         Command::new("sh")
@@ -1030,13 +1070,13 @@ async fn spawn_procnet_monitor(host: Option<&String>, interface: &str) -> Result
     );
 
     let child = if let Some(host) = host {
-        // Use -tt to force pseudo-terminal allocation, which disables SSH buffering
+        // SSH without pseudo-terminal - allows password prompt via stdin/stderr
         Command::new("ssh")
-            .arg("-tt")
             .arg(host)
             .arg(&script)
+            .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()?
     } else {
         Command::new("sh")
@@ -1834,6 +1874,159 @@ async fn run_http_server(ip: String, port: u16) -> Result<()> {
     Ok(())
 }
 
+// Get available network interfaces from the system
+fn get_network_interfaces() -> Result<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, use ifconfig to list interfaces
+        let output = StdCommand::new("ifconfig")
+            .arg("-l")
+            .output()?;
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let mut interfaces: Vec<String> = output_str
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .filter(|s| !s.starts_with("lo") && !s.starts_with("gif") && !s.starts_with("stf"))
+            .collect();
+
+        interfaces.sort();
+        return Ok(interfaces);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, read from /sys/class/net
+        let mut interfaces = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with("lo") {
+                    interfaces.push(name);
+                }
+            }
+        }
+
+        interfaces.sort();
+        return Ok(interfaces);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+// Run interactive first-time setup
+fn run_first_time_setup() -> Result<BandwidthConfig> {
+    println!("\n=== WLED Bandwidth Meter - First Time Setup ===\n");
+
+    // 1. Query and display network interfaces
+    println!("Detecting network interfaces...\n");
+    let interfaces = get_network_interfaces()?;
+
+    if interfaces.is_empty() {
+        eprintln!("Error: No network interfaces found!");
+        std::process::exit(1);
+    }
+
+    println!("Available network interfaces:");
+    for (i, iface) in interfaces.iter().enumerate() {
+        println!("  {}. {}", i + 1, iface);
+    }
+
+    // Prompt for interface selection
+    let interface = loop {
+        print!("\nSelect interface (1-{}): ", interfaces.len());
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if let Ok(choice) = input.trim().parse::<usize>() {
+            if choice > 0 && choice <= interfaces.len() {
+                break interfaces[choice - 1].clone();
+            }
+        }
+        println!("Invalid selection. Please enter a number between 1 and {}", interfaces.len());
+    };
+
+    println!("Selected: {}\n", interface);
+
+    // 2. Prompt for WLED IP
+    print!("Enter WLED IP address or hostname (e.g., led.local or 192.168.1.100): ");
+    io::stdout().flush()?;
+    let mut wled_ip = String::new();
+    io::stdin().read_line(&mut wled_ip)?;
+    let wled_ip = wled_ip.trim().to_string();
+
+    if wled_ip.is_empty() {
+        eprintln!("Error: WLED IP address is required!");
+        std::process::exit(1);
+    }
+
+    println!();
+
+    // 3. Prompt for total LEDs
+    let total_leds = loop {
+        print!("Enter total number of LEDs in your strip: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if let Ok(leds) = input.trim().parse::<usize>() {
+            if leds > 0 {
+                break leds;
+            }
+        }
+        println!("Invalid input. Please enter a positive number.");
+    };
+
+    println!();
+
+    // 4. Prompt for max interface speed
+    let max_gbps = loop {
+        print!("Enter maximum interface speed in Gbps (e.g., 1.0, 2.5, 10.0): ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if let Ok(speed) = input.trim().parse::<f64>() {
+            if speed > 0.0 {
+                break speed;
+            }
+        }
+        println!("Invalid input. Please enter a positive number.");
+    };
+
+    println!("\n=== Configuration Summary ===");
+    println!("Interface: {}", interface);
+    println!("WLED IP: {}", wled_ip);
+    println!("Total LEDs: {}", total_leds);
+    println!("Max Speed: {} Gbps", max_gbps);
+    println!("\nAll other settings will use default values.");
+    println!("You can modify these later via the config file or web interface at http://localhost:8080\n");
+
+    // Create config with provided values and defaults
+    let mut config = BandwidthConfig::default();
+    config.interface = interface;
+    config.wled_ip = wled_ip;
+    config.total_leds = total_leds;
+    config.max_gbps = max_gbps;
+
+    // Save the config
+    config.save()?;
+    println!("Configuration saved to: {}\n", BandwidthConfig::config_path()?.display());
+    println!("Starting bandwidth meter...\n");
+
+    // Give user a moment to read the summary
+    thread::sleep(Duration::from_secs(2));
+
+    Ok(config)
+}
+
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -1844,10 +2037,95 @@ fn main() -> Result<()> {
         return rt.block_on(test_mode(&args));
     }
 
+    // Check for first-run scenario BEFORE setting up terminal
+    // First-run: no config file exists AND no command-line args provided
+    let config_path = BandwidthConfig::config_path()?;
+    let config_file_exists = config_path.exists();
+
+    // Check if any meaningful args were provided (excluding program name)
+    let has_args = std::env::args().len() > 1;
+
+    if !config_file_exists && !has_args {
+        // First run - run interactive setup
+        let _config = run_first_time_setup()?;
+        // Config has been saved by run_first_time_setup, continue to normal startup
+    }
+
     // Create tokio runtime for bandwidth reading task only - keep it alive for entire session
     let _rt = tokio::runtime::Runtime::new()?;
 
-    // Setup terminal FIRST before ANYTHING else - this MUST be first to capture all output
+    // Load existing config or create default, then merge with command line args
+    // Note: config_file_exists was already checked above for first-run detection
+    let mut config = BandwidthConfig::load_or_default();
+    let args_provided = config.merge_with_args(&args);
+
+    // Only save if command-line args were provided OR if config file doesn't exist
+    // This prevents overwriting existing config values on every launch
+    // After first-run setup, config_file_exists will be true, so this only saves if args provided
+    if args_provided || !config_file_exists {
+        config.save()?;
+    }
+
+    // IMPORTANT: Establish SSH connection BEFORE setting up TUI
+    // This allows SSH to prompt for password using normal stdin/stdout
+    let quiet = args.quiet;
+
+    println!("Connecting to bandwidth monitor...");
+    if args.host.is_some() {
+        println!("Please enter your SSH password when prompted...\n");
+    }
+
+    let child_result = _rt.block_on(spawn_bandwidth_monitor(&args, &config));
+    let mut child = match child_result {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: Failed to start bandwidth monitor: {}", e);
+            return Err(e);
+        }
+    };
+
+    // For remote connections, wait for first line of output to ensure connection succeeded
+    if args.host.is_some() {
+        println!("Waiting for connection to establish...");
+
+        let wait_result = _rt.block_on(async {
+            if let Some(stdout) = child.stdout.take() {
+                let mut reader = BufReader::new(stdout);
+                let mut first_line = String::new();
+
+                match reader.read_line(&mut first_line).await {
+                    Ok(0) => {
+                        Err(anyhow::anyhow!("SSH connection failed or closed immediately"))
+                    }
+                    Ok(_) => {
+                        println!("Connection established!");
+                        // Put stdout back for later use
+                        child.stdout = Some(reader.into_inner());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        Err(anyhow::anyhow!("Error reading from SSH: {}", e))
+                    }
+                }
+            } else {
+                Err(anyhow::anyhow!("No stdout available"))
+            }
+        });
+
+        if let Err(e) = wait_result {
+            eprintln!("Error: {}", e);
+            eprintln!("Please check your SSH credentials and try again");
+            return Err(e);
+        }
+    }
+
+    println!("Connected successfully!\n");
+
+    // Clear the terminal to remove password prompt residue
+    print!("\x1B[2J\x1B[1;1H");
+    io::stdout().flush()?;
+
+    // NOW setup terminal - after SSH connection is established
     enable_raw_mode()?;
     let mut stdout_handle = io::stdout();
     stdout_handle.execute(EnterAlternateScreen)?;
@@ -1865,18 +2143,6 @@ fn main() -> Result<()> {
         let _ = io::stdout().execute(Show);
         original_hook(panic_info);
     }));
-
-    // Load existing config or create default, then merge with command line args
-    let config_path = BandwidthConfig::config_path()?;
-    let config_file_exists = config_path.exists();
-    let mut config = BandwidthConfig::load_or_default();
-    let args_provided = config.merge_with_args(&args);
-
-    // Only save if command-line args were provided OR if config file doesn't exist
-    // This prevents overwriting existing config values on every launch
-    if args_provided || !config_file_exists {
-        config.save()?;
-    }
 
     // Create shared state for renderer
     let tx_color = if config.tx_color.is_empty() {
@@ -1973,24 +2239,11 @@ fn main() -> Result<()> {
         renderer.run();
     });
 
-    let child_result = _rt.block_on(spawn_bandwidth_monitor(&args, &config));
-    let mut child = match child_result {
-        Ok(c) => c,
-        Err(e) => {
-            // Cleanup terminal before showing error
-            terminal.show_cursor()?;
-            disable_raw_mode()?;
-            terminal.backend_mut().execute(LeaveAlternateScreen)?;
-            return Err(e);
-        }
-    };
-
     let (bandwidth_tx, bandwidth_rx) = mpsc::channel::<String>();
     let (config_tx, config_rx) = mpsc::channel::<BandwidthConfig>();
 
     // Message log stored locally
     let mut messages: Vec<String> = Vec::new();
-    let quiet = args.quiet;
 
     let leds_per_direction = config.total_leds / 2;
 
@@ -2082,18 +2335,23 @@ fn main() -> Result<()> {
                 eprintln!("HTTP server error: {}", e);
             }
         });
-        
-        if !quiet {
-            messages.push(format!("[{}] HTTP server running at http://{}:{}", get_timestamp(), config.httpd_ip, config.httpd_port));
-        }
     }
 
     // Force initial render
     {
-        let status_line = format!(
-            "Edit {} to change settings | Press Ctrl+C to quit",
-            config_path.display()
-        );
+        let status_line = if config.httpd_enabled {
+            format!(
+                "Edit {} to change settings | Web UI: http://{}:{} | Press Ctrl+C to quit",
+                config_path.display(),
+                config.httpd_ip,
+                config.httpd_port
+            )
+        } else {
+            format!(
+                "Edit {} to change settings | Press Ctrl+C to quit",
+                config_path.display()
+            )
+        };
 
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -2597,10 +2855,19 @@ fn main() -> Result<()> {
 
         // Render only when something changed
         if needs_render {
-            let status_text = format!(
-                "Edit {} to change settings | Press Ctrl+C to quit",
-                config_path.display()
-            );
+            let status_text = if config.httpd_enabled {
+                format!(
+                    "Edit {} to change settings | Web UI: http://{}:{} | Press Ctrl+C to quit",
+                    config_path.display(),
+                    config.httpd_ip,
+                    config.httpd_port
+                )
+            } else {
+                format!(
+                    "Edit {} to change settings | Press Ctrl+C to quit",
+                    config_path.display()
+                )
+            };
 
             terminal.draw(|f| {
                 let chunks = Layout::default()
