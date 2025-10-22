@@ -105,6 +105,61 @@ cp target/release/bandwidth_meter ~/bin/
 
 ## Quick Start
 
+### First Run - Interactive Setup
+
+When you run the bandwidth meter for the first time without any arguments, it will launch an interactive setup wizard:
+
+```bash
+bandwidth_meter
+```
+
+The setup wizard will:
+
+1. **Detect network interfaces** - Scans your system and displays a numbered list of available interfaces
+2. **Prompt for interface selection** - Choose your interface by number (e.g., 1 for en0, 2 for eth0)
+3. **Request WLED IP** - Enter your WLED device IP address or hostname (e.g., `led.local` or `192.168.1.100`)
+4. **Request total LEDs** - Enter the number of LEDs in your strip (e.g., `600`, `1200`)
+5. **Request max bandwidth** - Enter your maximum interface speed in Gbps (e.g., `1.0`, `2.5`, `10.0`)
+
+Example first-run session:
+
+```
+=== WLED Bandwidth Meter - First Time Setup ===
+
+Detecting network interfaces...
+
+Available network interfaces:
+  1. en0
+  2. en1
+  3. eth0
+
+Select interface (1-3): 1
+Selected: en0
+
+Enter WLED IP address or hostname (e.g., led.local or 192.168.1.100): led.local
+
+Enter total number of LEDs in your strip: 600
+
+Enter maximum interface speed in Gbps (e.g., 1.0, 2.5, 10.0): 10.0
+
+=== Configuration Summary ===
+Interface: en0
+WLED IP: led.local
+Total LEDs: 600
+Max Speed: 10.0 Gbps
+
+All other settings will use default values.
+You can modify these later via the config file or web interface at http://localhost:8080
+
+Configuration saved to: /Users/username/.config/bandwidth_meter/config.conf
+
+Starting bandwidth meter...
+```
+
+After the initial setup, the configuration is saved and you can run `bandwidth_meter` without arguments to use your saved settings.
+
+### Command-Line Usage
+
 1. **Basic local monitoring** (macOS/Linux):
    ```bash
    bandwidth_meter -i en0 -w led.local
@@ -183,12 +238,12 @@ Enable or disable the built-in web configuration interface.
 
 #### `httpd_ip`
 **Type:** String
-**Default:** `"0.0.0.0"`
+**Default:** `"localhost"`
 **Requires Restart:** Yes
 
 IP address for the HTTP server to listen on.
-- `"0.0.0.0"` - Listen on all interfaces
-- `"127.0.0.1"` - Localhost only (more secure)
+- `"localhost"` or `"127.0.0.1"` - Localhost only (default, more secure)
+- `"0.0.0.0"` - Listen on all interfaces (use when accessing from other devices)
 
 #### `httpd_port`
 **Type:** Integer
@@ -679,19 +734,19 @@ Access the web interface at `http://localhost:8080` (or your configured IP/port)
 
 ### Security Considerations
 
-By default, the web interface listens on `0.0.0.0:8080` (all interfaces). For security:
+By default, the web interface listens on `localhost:8080` (local access only). To allow access from other devices on your network:
 
-1. **Localhost only**:
+1. **Allow network access**:
    ```toml
-   httpd_ip = "127.0.0.1"
+   httpd_ip = "0.0.0.0"
    ```
 
-2. **Disable HTTP server**:
+2. **Disable HTTP server** (if not needed):
    ```toml
    httpd_enabled = false
    ```
 
-3. **Firewall**: Use your OS firewall to restrict access
+3. **Firewall**: Use your OS firewall to restrict access if using `0.0.0.0`
 
 ## Troubleshooting
 
