@@ -2,6 +2,8 @@
 
 A real-time network bandwidth visualization tool that displays upload and download traffic on WLED LED strips using the DDP protocol. Written in Rust for high performance and low latency.
 
+100% of this code was generated using Claude Code. If you have any problems running this code, please ask Claude.
+
 ## Features
 
 - **Real-time Visualization**: Monitor network bandwidth with smooth, interpolated LED animations
